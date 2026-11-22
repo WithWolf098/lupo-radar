@@ -76,6 +76,8 @@ const CREATEURS_TOUS = 6 * HEURE;
 /** Un thème : au moins 3 jeux suivis et 50 joueurs. */
 const THEME_JEUX_MIN = 3;
 const THEME_JOUEURS_MIN = 50;
+/** Récap « Depuis ta dernière visite » : après 3 h sans Lupo ouvert. */
+const ABSENCE_RECAP = 3 * HEURE;
 const ENTETES = { 'User-Agent': 'Lupo', Accept: 'application/json' };
 /** Mots cherchés dans Roblox pour découvrir des jeux (genres, mécaniques, thèmes courants). */
 exports.MOTS_DECOUVERTE = [
@@ -426,6 +428,7 @@ class Radar {
     signaler;
     journal;
     alerter;
+    recapper;
     db;
     etat = { actif: true, enCours: null, jeuxSuivis: 0, jeuxConnus: 0 };
     minuterie = null;
@@ -451,11 +454,14 @@ class Radar {
     serveur = radarPartage_1.SERVEUR_RADAR;
     /** Vrai = pas de relevé automatique toutes les 30 min (le serveur appelle `cycle()` lui-même). */
     manuel = false;
-    constructor(dossier, signaler = () => { }, journal = () => { }, alerter = () => { }) {
+    /** Dernière fois que Lupo était ouvert (lu au démarrage) : récap au premier relevé si c'est loin. */
+    absentDepuis = null;
+    constructor(dossier, signaler = () => { }, journal = () => { }, alerter = () => { }, recapper = () => { }) {
         this.dossier = dossier;
         this.signaler = signaler;
         this.journal = journal;
         this.alerter = alerter;
+        this.recapper = recapper;
         fs.mkdirSync(dossier, { recursive: true });
         this.db = new node_sqlite_1.DatabaseSync(path.join(dossier, 'radar.db'));
         this.db.exec(`
@@ -522,6 +528,8 @@ class Radar {
         const s = Number(this.meta('serveurLe'));
         if (s)
             this.etat.serveurLe = s;
+        this.absentDepuis = Number(this.meta('ouvertLe')) || null;
+        this.ecrireMeta('ouvertLe', Date.now());
         this.compter();
     }
     // ----- Petits accès à la base -----
@@ -564,6 +572,7 @@ class Radar {
             clearTimeout(this.minuterie);
         this.minuterie = null;
         try {
+            this.ecrireMeta('ouvertLe', Date.now());
             this.db.close();
         }
         catch {
@@ -632,6 +641,10 @@ class Radar {
             }
         }
         const maintenant = Date.now();
+        // Premier relevé après une absence de 3 h ou plus : récap au lieu des notifications d’alertes (pas sur le serveur, sans adresse de partage).
+        const absence = this.serveur !== null && this.absentDepuis && maintenant - this.absentDepuis >= ABSENCE_RECAP ? this.absentDepuis : null;
+        this.absentDepuis = null;
+        let alertesAbsence = [];
         if (maintenant - Number(this.meta('decouverteLe') ?? 0) >= DECOUVERTE_TOUS)
             await etape('Recherche de nouveaux jeux', async () => {
                 await this.decouvrir(partage);
@@ -648,10 +661,19 @@ class Radar {
         await etape('Vérification des favoris', async () => {
             const a = [...this.alertesCreateurs, ...this.verifierFavoris()];
             this.alertesCreateurs = [];
-            if (a.length)
+            if (absence)
+                alertesAbsence = a;
+            else if (a.length)
                 this.alerter(a);
         });
         await etape('Icônes', () => this.lireIcones());
+        if (absence)
+            await etape('Récap de ton absence', async () => {
+                const r = this.calculerRecap(absence, alertesAbsence);
+                this.ecrireMeta('recap', JSON.stringify(r));
+                if (r.favoris.length || r.studios.length || r.jeunes.length || r.nouveaux.length || r.gros.length || r.themes.length)
+                    this.recapper(r);
+            });
         // Jeux semblables : 3 recherches par jeu, faites par le serveur quand il est là (moins de demandes à Roblox par Lupo).
         if (!partage)
             await etape('Recherche des jeux semblables', () => this.chercherSemblables());
@@ -665,6 +687,8 @@ class Radar {
             return;
         this.compter();
         this.publier({ enCours: null, avance: undefined, erreur: erreurs.length ? erreurs.join(' · ') : undefined });
+        if (this.serveur !== null)
+            this.ecrireMeta('ouvertLe', Date.now());
         this.planifier(Math.max(5 * MIN, debut + INTERVALLE - Date.now()));
     }
     stop = () => this.arrete;
@@ -756,7 +780,8 @@ class Radar {
         const releve = this.db.prepare('INSERT INTO releves (jeu, t, joueurs, visites) VALUES (?, ?, ?, ?)');
         const disparu = this.db.prepare('UPDATE jeux SET suivi = 0, vu = ? WHERE id = ?');
         const avant = Number(this.meta('dernierReleve') ?? 0);
-        this.apresTrou = !!avant && t - avant > JOUR;
+        // Trou de plus de 24 h dans nos relevés : pas d'alerte ce tour-ci (avec le serveur, pas de trou dans les données).
+        this.apresTrou = !partage && !!avant && t - avant > JOUR;
         for (let i = 0; i < ids.length; i += 50) {
             const lot = ids.slice(i, i + 50);
             const r = await lireJson(`https://games.roblox.com/v1/games?universeIds=${lot.join(',')}`, this.c.jeux, this.stop);
@@ -987,6 +1012,170 @@ class Radar {
     copierBase(fichier) {
         fs.rmSync(fichier, { force: true });
         this.db.prepare('VACUUM INTO ?').run(fichier);
+    }
+    // ----- Récap « Depuis ta dernière visite » -----
+    /** Dernier récap calculé (null s'il n'y en a jamais eu). */
+    dernierRecap() {
+        try {
+            const r = this.meta('recap');
+            return r ? JSON.parse(r) : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * Ce qui a bougé depuis `depuis` (dernière fois que Lupo était ouvert) : favoris (en %), nouveaux jeux des studios suivis,
+     * jeunes jeux, nouveaux jeux, gros jeux et thèmes qui ont le plus monté. « Avant » = relevé le plus proche de `depuis`
+     * (1 h 30 avant à 3 h après) ; un jeu sans relevé à ce moment n'est comparé que s'il est sorti depuis.
+     */
+    calculerRecap(depuis, alertes) {
+        const t = Date.now();
+        const ref = Math.max(depuis, t - (JOURS_DETAILLES - 1) * JOUR);
+        const avant = new Map();
+        for (const r of this.db.prepare('SELECT jeu, t, joueurs FROM releves WHERE t BETWEEN ? AND ?').all(ref - 90 * MIN, ref + 3 * HEURE)) {
+            const e = Math.abs(r.t - ref);
+            const v = avant.get(r.jeu);
+            if (!v || e < v.e)
+                avant.set(r.jeu, { j: r.joueurs, e });
+        }
+        const jeux = this.db.prepare('SELECT id, nom, createur, icone, cree, joueurs, bots FROM jeux WHERE vu > ?').all(t - 3 * HEURE).filter((g) => g.nom);
+        const vers = (g) => ({
+            id: g.id,
+            nom: g.nom ?? '',
+            createur: g.createur ?? '',
+            ...(g.icone ? { icone: g.icone } : {}),
+            cree: g.cree ?? 0,
+            avant: avant.get(g.id)?.j ?? null,
+            apres: g.joueurs ?? 0,
+        });
+        const sains = jeux.filter((g) => (g.bots ?? 0) <= 60);
+        const hausse = (g) => (g.joueurs ?? 0) / Math.max(1, avant.get(g.id)?.j ?? 0) - 1;
+        const jeunes = sains
+            .filter((g) => g.cree && g.cree > t - 120 * JOUR && g.cree <= ref && (avant.get(g.id)?.j ?? 0) >= 30 && (g.joueurs ?? 0) >= 100 && hausse(g) >= 0.2)
+            .sort((a, b) => hausse(b) - hausse(a))
+            .slice(0, 10)
+            .map(vers);
+        const gros = sains
+            .filter((g) => (avant.get(g.id)?.j ?? 0) >= 5000 && hausse(g) >= 0.05)
+            .sort((a, b) => hausse(b) - hausse(a))
+            .slice(0, 6)
+            .map(vers);
+        const nouveaux = sains
+            .filter((g) => g.cree && g.cree > ref && (g.joueurs ?? 0) >= 100)
+            .sort((a, b) => (b.joueurs ?? 0) - (a.joueurs ?? 0))
+            .slice(0, 8)
+            .map(vers);
+        const parTheme = new Map();
+        for (const g of sains) {
+            const a = avant.get(g.id)?.j;
+            const neuf = !!g.cree && g.cree > ref;
+            if (a === undefined && !neuf)
+                continue;
+            const mots = motsDuTitre(g.nom ?? '');
+            const cles = new Map(mots.map((m) => [m, m]));
+            for (let i = 0; i + 1 < mots.length; i++)
+                cles.set([mots[i], mots[i + 1]].sort().join(' '), `${mots[i]} ${mots[i + 1]}`);
+            for (const [cle, libelle] of cles) {
+                let th = parTheme.get(cle);
+                if (!th)
+                    parTheme.set(cle, (th = { cle, libelle, jeux: 0, avant: 0, apres: 0, top: [] }));
+                th.jeux++;
+                th.avant += a ?? 0;
+                th.apres += g.joueurs ?? 0;
+                th.top.push({ j: g.joueurs ?? 0, ...(g.icone ? { icone: g.icone } : {}) });
+            }
+        }
+        const gardes = [...parTheme.values()].filter((th) => th.jeux >= THEME_JEUX_MIN && th.avant >= 200);
+        const parCle = new Map(gardes.map((th) => [th.cle, th]));
+        const redondants = new Set();
+        for (const th of gardes) {
+            const mots = th.cle.split(' ');
+            if (mots.length < 2)
+                continue;
+            for (const m of mots) {
+                const u = parCle.get(m);
+                if (u && th.jeux >= 0.9 * u.jeux)
+                    redondants.add(m);
+            }
+        }
+        const themes = gardes
+            .filter((th) => !redondants.has(th.cle) && th.apres > th.avant * 1.1)
+            .map((th) => ({ ...th, top: th.top.sort((a, b) => b.j - a.j) }))
+            .filter((th) => th.top[0].j < 0.8 * th.apres) // pas un thème porté par un seul jeu
+            .sort((a, b) => b.apres / b.avant - a.apres / a.avant)
+            .slice(0, 8)
+            .map((th) => ({
+            cle: th.libelle,
+            jeux: th.jeux,
+            avant: th.avant,
+            apres: th.apres,
+            icones: th.top.slice(0, 3).flatMap((x) => (x.icone ? [x.icone] : [])),
+        }));
+        // Favoris : % depuis ton départ, ×N depuis l'étoile, palier franchi.
+        const favs = this.db.prepare('SELECT type, cle, ajoute, base, nom FROM favoris').all();
+        const tousJeux = favs.some((f) => f.type === 'theme') ? this.jeuxPourThemes() : [];
+        const jeuDe = this.db.prepare('SELECT nom, joueurs, icone FROM jeux WHERE id = ?');
+        const favoris = [];
+        for (const f of favs) {
+            const alerte = alertes.find((a) => a.type === f.type && a.cle === f.cle);
+            const marques = { ...(alerte?.sorte === 'palier' ? { palier: alerte.ratio } : {}), ...(alerte?.sorte === 'regulier' ? { regulier: true } : {}) };
+            if (f.type === 'jeu') {
+                const j = jeuDe.get(Number(f.cle));
+                if (!j)
+                    continue;
+                const apres = j.joueurs ?? 0;
+                favoris.push({
+                    type: 'jeu',
+                    cle: f.cle,
+                    nom: j.nom ?? f.cle,
+                    ...(j.icone ? { icone: j.icone } : {}),
+                    avant: avant.get(Number(f.cle))?.j ?? null,
+                    apres,
+                    ratioEtoile: apres / Math.max(BASE_MIN, f.base ?? 0),
+                    ...marques,
+                });
+            }
+            else if (f.type === 'theme') {
+                const cherches = f.cle.split(' ');
+                let a = 0;
+                let p = 0;
+                let comparables = 0;
+                for (const g of sains) {
+                    const av = avant.get(g.id)?.j;
+                    if (av === undefined && !(g.cree && g.cree > ref))
+                        continue;
+                    const mots = motsDuTitre(g.nom ?? '');
+                    if (!cherches.every((m) => mots.includes(m)))
+                        continue;
+                    a += av ?? 0;
+                    p += g.joueurs ?? 0;
+                    comparables++;
+                }
+                const niveau = this.niveauTheme(f.cle, f.ajoute, tousJeux).joueurs;
+                favoris.push({
+                    type: 'theme',
+                    cle: f.cle,
+                    nom: f.cle,
+                    avant: comparables ? a : null,
+                    apres: comparables ? p : niveau,
+                    ratioEtoile: niveau / Math.max(BASE_MIN, f.base ?? 0),
+                    ...marques,
+                });
+            }
+        }
+        // Plus gros changements d'abord.
+        const ecart = (x) => (x.avant ? Math.abs(x.apres / x.avant - 1) : 0);
+        favoris.sort((a, b) => Number(!!b.palier || !!b.regulier) - Number(!!a.palier || !!a.regulier) || ecart(b) - ecart(a));
+        const studios = [];
+        const neufsDe = this.db.prepare('SELECT id, nom FROM jeux WHERE createurId = ? AND createurType = ? AND cree > ? ORDER BY cree DESC LIMIT 10');
+        for (const f of favs.filter((x) => x.type === 'createur')) {
+            const [type, id] = f.cle.split(':');
+            const l = neufsDe.all(Number(id), type, ref);
+            if (l.length)
+                studios.push({ cle: f.cle, nom: f.nom || f.cle, jeux: l });
+        }
+        return { depuis, le: t, favoris, studios, jeunes, nouveaux, gros, themes };
     }
     // ----- Rangement -----
     /** Relevés de plus de 11 jours : résumés par jour (médiane, max), puis effacés. */
