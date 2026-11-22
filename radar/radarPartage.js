@@ -48,9 +48,33 @@ const fs = __importStar(require("node:fs"));
 exports.SERVEUR_RADAR = process.env.LUPO_RADAR_SERVEUR ?? 'https://github.com/WithWolf098/lupo-radar/releases/download/donnees';
 /** Colonnes d'un jeu échangées (les indicateurs calculés ne le sont pas : chaque Lupo les recalcule). */
 const COLONNES = [
-    'id', 'place', 'nom', 'createur', 'createurId', 'createurType', 'genre', 'cree', 'maj', 'visites', 'favoris', 'haut', 'bas',
-    'joueurs', 'vu', 'decouvert', 'source', 'suivi', 'sponsor', 'record', 'votesLe', 'icone', 'iconeLe',
-    'semblables', 'partN1', 'semblablesListe', 'semblablesLe',
+    'id',
+    'place',
+    'nom',
+    'createur',
+    'createurId',
+    'createurType',
+    'genre',
+    'cree',
+    'maj',
+    'visites',
+    'favoris',
+    'haut',
+    'bas',
+    'joueurs',
+    'vu',
+    'decouvert',
+    'source',
+    'suivi',
+    'sponsor',
+    'record',
+    'votesLe',
+    'icone',
+    'iconeLe',
+    'semblables',
+    'partN1',
+    'semblablesListe',
+    'semblablesLe',
 ];
 /** Colonnes qui viennent du dernier relevé : prises au serveur seulement si son relevé est plus récent. */
 const DU_RELEVE = ['nom', 'place', 'createur', 'createurId', 'createurType', 'genre', 'cree', 'maj', 'visites', 'favoris', 'joueurs', 'vu', 'suivi'];

@@ -652,7 +652,9 @@ class Radar {
                 this.alerter(a);
         });
         await etape('Icônes', () => this.lireIcones());
-        await etape('Recherche des jeux semblables', () => this.chercherSemblables());
+        // Jeux semblables : 3 recherches par jeu, faites par le serveur quand il est là (moins de demandes à Roblox par Lupo).
+        if (!partage)
+            await etape('Recherche des jeux semblables', () => this.chercherSemblables());
         if (maintenant - Number(this.meta('maintenanceLe') ?? 0) >= JOUR)
             await etape('Rangement de l’historique', async () => {
                 this.ranger();
@@ -1017,7 +1019,10 @@ class Radar {
     lignes(ids) {
         const t = Date.now();
         const st = this.db.prepare('SELECT * FROM jeux WHERE id = ?');
-        return ids.map((id) => st.get(id)).filter((r) => !!r).map((r) => this.versLigne(r, t));
+        return ids
+            .map((id) => st.get(id))
+            .filter((r) => !!r)
+            .map((r) => this.versLigne(r, t));
     }
     /** Id du jeu (universe) d'une place, s'il est connu du radar. */
     jeuDeLaPlace(place) {
@@ -1029,7 +1034,14 @@ class Radar {
         const vus = new Set();
         return r
             .filter((g) => g.universeId && g.name && !vus.has(g.universeId) && vus.add(g.universeId))
-            .map((g) => ({ id: g.universeId, place: g.rootPlaceId ?? 0, nom: g.name, joueurs: g.playerCount ?? 0, haut: g.totalUpVotes ?? 0, bas: g.totalDownVotes ?? 0 }));
+            .map((g) => ({
+            id: g.universeId,
+            place: g.rootPlaceId ?? 0,
+            nom: g.name,
+            joueurs: g.playerCount ?? 0,
+            haut: g.totalUpVotes ?? 0,
+            bas: g.totalDownVotes ?? 0,
+        }));
     }
     /** Détails en direct (Roblox) de jeux par id : créateur, visites, favoris, dates. */
     async detailsEnDirect(ids) {
@@ -1151,7 +1163,23 @@ class Radar {
             for (const [cle, libelle] of cles) {
                 let a = par.get(cle);
                 if (!a) {
-                    a = { cle, libelle, jeux: 0, joueurs: 0, jeunes: 0, joueursJeunes: 0, rec: 0, anc: 0, n7: 0, apres: 0, avant: 0, n24: 0, rythme: 0, moyen: 0, top: [] };
+                    a = {
+                        cle,
+                        libelle,
+                        jeux: 0,
+                        joueurs: 0,
+                        jeunes: 0,
+                        joueursJeunes: 0,
+                        rec: 0,
+                        anc: 0,
+                        n7: 0,
+                        apres: 0,
+                        avant: 0,
+                        n24: 0,
+                        rythme: 0,
+                        moyen: 0,
+                        top: [],
+                    };
                     par.set(cle, a);
                 }
                 a.jeux++;
@@ -1529,9 +1557,7 @@ class Radar {
                 .then((jeux) => {
                 if (this.arrete)
                     return;
-                this.db
-                    .prepare("UPDATE favoris SET ids = ? WHERE type = 'createur' AND cle = ? AND ids IS NULL")
-                    .run(JSON.stringify(jeux.map((j) => j.id)), cle);
+                this.db.prepare("UPDATE favoris SET ids = ? WHERE type = 'createur' AND cle = ? AND ids IS NULL").run(JSON.stringify(jeux.map((j) => j.id)), cle);
             })
                 .catch((e) => this.journal(`Radar, jeux du studio « ${nom} » : ${e.message}`));
             return this.favoris();
