@@ -1,0 +1,38 @@
+name: Radar
+
+# Relevés des jeux Roblox toutes les 30 min. Chaque tâche dure ~5 h 30 puis se relance elle-même ;
+# le déclenchement horaire sert de filet si la chaîne casse (GitHub saute souvent les crons des petits dépôts).
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: radar
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  relever:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TZ: Europe/Paris
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # Réactive le cron s'il a été coupé après 60 jours sans activité du dépôt.
+      - run: gh workflow enable radar.yml || true
+      - run: node --no-warnings radar/radarCollecteur.js
+        env:
+          DUREE_MIN: 330
+      - name: Relancer
+        if: success()
+        run: gh workflow run radar.yml
