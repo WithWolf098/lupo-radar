@@ -33,12 +33,13 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Radar = exports.MOTS_DECOUVERTE = void 0;
+exports.Radar = exports.cleTriee = exports.MOTS_DECOUVERTE = void 0;
 exports.motsDuTitre = motsDuTitre;
 exports.calculerIndicateurs = calculerIndicateurs;
 exports.estimerPercer = estimerPercer;
 exports.estimerBots = estimerBots;
 exports.scoreTheme = scoreTheme;
+exports.fusionnerThemes = fusionnerThemes;
 const fs = __importStar(require("node:fs"));
 const path = __importStar(require("node:path"));
 const node_crypto_1 = require("node:crypto");
@@ -423,6 +424,97 @@ function estimerBots(rel, f, maintenant) {
 function scoreTheme(th) {
     return th.croissance7 ?? th.croissance24 ?? (th.elan !== null ? (th.elan - 1) * 100 : -1000);
 }
+/** Clé d'un thème aux mots triés (« steal brainrot » = « brainrot steal »). */
+const cleTriee = (cle) => cle.split(' ').sort().join(' ');
+exports.cleTriee = cleTriee;
+/**
+ * Un mot presque toujours suivi du même autre (« defense » → « tower defense ») : on garde seulement les deux mots.
+ * Un mot en favori (`proteges`) reste.
+ */
+function motsRedondants(themes, proteges) {
+    const parCle = new Map(themes.map((a) => [a.cle, a]));
+    const redondants = new Set();
+    for (const a of themes) {
+        const mots = a.cle.split(' ');
+        if (mots.length < 2)
+            continue;
+        for (const m of mots) {
+            const u = parCle.get(m);
+            if (u && a.jeux >= 0.9 * u.jeux && !proteges.has(m))
+                redondants.add(m);
+        }
+    }
+    return redondants;
+}
+/** Part des joueurs d'un thème qui doivent jouer aux jeux d'un autre pour qu'on les fonde. */
+const FUSION_THEMES = 0.7;
+/** …et le petit thème doit peser au moins ça du gros : sinon c'est une niche dans un mot large (« bakso » dans « tower »). */
+const FUSION_PART_MIN = 0.2;
+/**
+ * Fond les thèmes portés surtout par les mêmes jeux, pour ne pas montrer deux fois la même vague (« letter » = les jeux
+ * « Thai … Letters » → rattaché à « thai »). En partant du plus gros : un thème dont au moins 70 % des joueurs jouent à des
+ * jeux d'un thème déjà gardé y est rattaché (`aussi`), s'il pèse au moins 20 % de ce thème (sinon c'est une niche dans un
+ * mot large : « bakso » reste à côté de « tower » ; essais du 2026-11-23 sur la vraie base). Si les mots de l'un sont dans ceux de l'autre (« hatcher divine » /
+ * « hatcher »), il faut en plus que le petit pèse 70 % du gros (sinon c'est un vrai sous-genre et les deux restent), et
+ * c'est alors le plus précis qui reste (« tower defense » plutôt que « defense »).
+ * `poids` = joueurs du thème, `ids` = jeu → ses joueurs (mêmes chiffres que `poids`).
+ * `proteges` (clés aux mots triés, voir `cleTriee`) : thèmes en favori, jamais rattachés à un autre ni remplacés par un plus précis.
+ */
+function fusionnerThemes(themes, proteges = new Set()) {
+    const gardes = [];
+    const parJeu = new Map(); // jeu → thèmes gardés qui le contiennent
+    // Un mot passe juste après la paire de mots qui le porte (« defense » après « tower defense »), pour pouvoir y être rattaché.
+    const paires = new Map(); // mot → joueurs de sa plus grosse paire
+    for (const b of themes)
+        for (const m of b.cle.includes(' ') ? b.cle.split(' ') : [])
+            paires.set(m, Math.max(paires.get(m) ?? 0, b.poids));
+    const rang = (x) => {
+        const p = x.cle.includes(' ') ? 0 : (paires.get(x.cle) ?? 0);
+        return p >= FUSION_THEMES * x.poids ? Math.min(p, x.poids) : x.poids;
+    };
+    const ordre = [...themes].sort((x, y) => rang(y) - rang(x) || y.cle.split(' ').length - x.cle.split(' ').length);
+    for (const a of ordre) {
+        const communs = new Map();
+        for (const [id, j] of a.ids)
+            for (const k of parJeu.get(id) ?? [])
+                communs.set(k, (communs.get(k) ?? 0) + j);
+        const motsA = a.cle.split(' ');
+        let cible = -1;
+        let meilleur = 0;
+        let lie = false;
+        // Thème en favori : toujours montré tel quel (il peut en revanche accueillir les autres).
+        if (!proteges.has((0, exports.cleTriee)(a.cle)))
+            for (const [k, c] of communs) {
+                const b = gardes[k];
+                const motsB = b.cle.split(' ');
+                const lies = motsA.every((m) => motsB.includes(m)) || motsB.every((m) => motsA.includes(m));
+                const part = c / Math.max(1, a.poids);
+                if (part < FUSION_THEMES || a.poids < (lies ? FUSION_THEMES : FUSION_PART_MIN) * b.poids)
+                    continue;
+                // Un thème aux mots liés passe avant (« defense » va dans « tower defense », pas dans « tower »).
+                if ((lies && !lie) || (lies === lie && part > meilleur))
+                    [meilleur, cible, lie] = [part, k, lies];
+            }
+        if (cible >= 0) {
+            const b = gardes[cible];
+            // Le plus précis prend la place (avec ses propres chiffres, pour que la fiche montre les mêmes jeux).
+            if (lie && motsA.length > b.cle.split(' ').length && !proteges.has((0, exports.cleTriee)(b.cle)))
+                gardes[cible] = { ...a, aussi: [...b.aussi, b.libelle] };
+            else
+                b.aussi.push(a.libelle);
+            continue;
+        }
+        for (const id of a.ids.keys()) {
+            const l = parJeu.get(id);
+            if (l)
+                l.push(gardes.length);
+            else
+                parJeu.set(id, [gardes.length]);
+        }
+        gardes.push({ ...a, aussi: [] });
+    }
+    return gardes;
+}
 class Radar {
     dossier;
     signaler;
@@ -456,6 +548,8 @@ class Radar {
     manuel = false;
     /** Dernière fois que Lupo était ouvert (lu au démarrage) : récap au premier relevé si c'est loin. */
     absentDepuis = null;
+    /** Jeux de l'utilisateur (projets reliés à un jeu Roblox) : suivis de près, avec leurs alertes (concurrent devant, thème qui monte). */
+    mesJeux = () => [];
     constructor(dossier, signaler = () => { }, journal = () => { }, alerter = () => { }, recapper = () => { }) {
         this.dossier = dossier;
         this.signaler = signaler;
@@ -485,6 +579,7 @@ class Radar {
       );
       CREATE TABLE IF NOT EXISTS alertes (t INTEGER, type TEXT, cle TEXT, nom TEXT, sorte TEXT, ratio REAL, joueurs INTEGER);
       CREATE TABLE IF NOT EXISTS createurs (cle TEXT PRIMARY KEY, verifieLe INTEGER);
+      CREATE TABLE IF NOT EXISTS mesjeux (id INTEGER PRIMARY KEY, nom TEXT, devant TEXT, alertes TEXT);
       CREATE INDEX IF NOT EXISTS jeux_createur ON jeux(createurId);
     `);
         // Colonnes ajoutées après la première version de la base.
@@ -651,6 +746,7 @@ class Radar {
                 this.ecrireMeta('decouverteLe', maintenant);
             });
         await etape('Nouveaux jeux des studios', () => this.verifierCreateurs(!partage && maintenant - Number(this.meta('createursLe') ?? 0) >= CREATEURS_TOUS));
+        await etape('Tes jeux et leurs concurrents', () => this.suivreMesJeux());
         await etape('Relevé des joueurs', () => this.relever(partage));
         if (!partage && maintenant - Number(this.meta('votesLe') ?? 0) >= VOTES_TOUS)
             await etape('Lecture des votes', async () => {
@@ -665,6 +761,10 @@ class Radar {
                 alertesAbsence = a;
             else if (a.length)
                 this.alerter(a);
+            // Ton propre jeu : prévenu même au retour d'une absence (le récap ne parle que des favoris).
+            const miens = this.verifierMesJeux();
+            if (miens.length)
+                this.alerter(miens);
         });
         await etape('Icônes', () => this.lireIcones());
         if (absence)
@@ -920,32 +1020,159 @@ class Radar {
          ORDER BY semblablesLe IS NOT NULL, semblablesLe, joueurs BETWEEN 100 AND 20000 DESC, cree DESC LIMIT 120`)
             .all(t - 180 * JOUR, t - JOUR);
         const session = (0, node_crypto_1.randomUUID)();
-        const st = this.db.prepare('UPDATE jeux SET semblables = ?, partN1 = ?, semblablesListe = ?, semblablesLe = ? WHERE id = ?');
         let fait = 0;
         for (const j of jeux) {
-            const mots = motsDuTitre(j.nom);
-            if (!mots.length) {
-                st.run(null, null, null, t, j.id);
-                continue;
-            }
-            const trouves = await this.rechercher(mots.slice(0, 4).join(' '), 3, session, 'semblables');
-            const vus = new Set([j.id]);
-            const semblables = [];
-            for (const g of trouves) {
-                if (!g.universeId || !g.name || vus.has(g.universeId))
-                    continue;
-                vus.add(g.universeId);
-                const autres = motsDuTitre(g.name);
-                if (autres.some((m) => mots.includes(m)))
-                    semblables.push({ id: g.universeId, placeId: g.rootPlaceId ?? 0, nom: g.name, joueurs: g.playerCount ?? 0 });
-            }
-            const moi = this.db.prepare('SELECT joueurs FROM jeux WHERE id = ?').get(j.id)?.joueurs ?? 0;
-            const tous = [moi, ...semblables.map((s) => s.joueurs)];
-            const somme = tous.reduce((a, b) => a + b, 0);
-            semblables.sort((a, b) => b.joueurs - a.joueurs);
-            st.run(semblables.length, somme > 0 ? Math.max(...tous) / somme : null, JSON.stringify(semblables.slice(0, 12)), Date.now(), j.id);
+            await this.semblablesDe(j, session);
             this.publier({ avance: ++fait / jeux.length });
         }
+    }
+    /** Jeux semblables d'un jeu (3 pages de recherche sur les mots de son titre), rangés dans sa ligne. */
+    async semblablesDe(j, session) {
+        const st = this.db.prepare('UPDATE jeux SET semblables = ?, partN1 = ?, semblablesListe = ?, semblablesLe = ? WHERE id = ?');
+        const mots = motsDuTitre(j.nom);
+        if (!mots.length) {
+            st.run(null, null, null, Date.now(), j.id);
+            return;
+        }
+        const trouves = await this.rechercher(mots.slice(0, 4).join(' '), 3, session, 'semblables');
+        const vus = new Set([j.id]);
+        const semblables = [];
+        for (const g of trouves) {
+            if (!g.universeId || !g.name || vus.has(g.universeId))
+                continue;
+            vus.add(g.universeId);
+            const autres = motsDuTitre(g.name);
+            if (autres.some((m) => mots.includes(m)))
+                semblables.push({ id: g.universeId, placeId: g.rootPlaceId ?? 0, nom: g.name, joueurs: g.playerCount ?? 0 });
+        }
+        const moi = this.db.prepare('SELECT joueurs FROM jeux WHERE id = ?').get(j.id)?.joueurs ?? 0;
+        const tous = [moi, ...semblables.map((s) => s.joueurs)];
+        const somme = tous.reduce((a, b) => a + b, 0);
+        semblables.sort((a, b) => b.joueurs - a.joueurs);
+        st.run(semblables.length, somme > 0 ? Math.max(...tous) / somme : null, JSON.stringify(semblables.slice(0, 12)), Date.now(), j.id);
+    }
+    // ----- Tes jeux (projets reliés) -----
+    /** Concurrents directs d'un de tes jeux : ses jeux semblables (même mot dans le titre), du plus gros au plus petit. */
+    concurrentsDe(id) {
+        const r = this.db.prepare('SELECT semblablesListe FROM jeux WHERE id = ?').get(id);
+        try {
+            return r?.semblablesListe ? JSON.parse(r.semblablesListe).map((s) => s.id) : [];
+        }
+        catch {
+            return [];
+        }
+    }
+    /**
+     * Avant chaque relevé : tes jeux (et leurs concurrents) rejoignent les jeux suivis de près, même petits ou vieux ;
+     * leurs jeux semblables sont recherchés une fois par jour. Un jeu délié de son projet n'est plus surveillé.
+     */
+    async suivreMesJeux() {
+        const miens = this.mesJeux().filter((j) => Number.isSafeInteger(j.id) && j.id > 0);
+        const t = Date.now();
+        const ids = miens.map((j) => j.id);
+        this.transaction(() => {
+            if (ids.length)
+                this.db.prepare(`DELETE FROM mesjeux WHERE id NOT IN (${ids.map(() => '?').join(',')})`).run(...ids);
+            else
+                this.db.exec('DELETE FROM mesjeux');
+            const ajout = this.db.prepare('INSERT INTO mesjeux (id, nom) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET nom = excluded.nom');
+            const jeu = this.db.prepare(`INSERT INTO jeux (id, nom, decouvert, source, suivi) VALUES (?, ?, ?, 'mien', 1)
+        ON CONFLICT(id) DO UPDATE SET suivi = 1`);
+            for (const j of miens) {
+                ajout.run(j.id, j.nom);
+                jeu.run(j.id, j.nom, t);
+            }
+        });
+        if (!miens.length)
+            return;
+        const session = (0, node_crypto_1.randomUUID)();
+        for (const j of miens) {
+            const r = this.db.prepare('SELECT nom, semblablesLe FROM jeux WHERE id = ?').get(j.id);
+            if (!r?.semblablesLe || r.semblablesLe < t - JOUR) {
+                await this.semblablesDe({ id: j.id, nom: r?.nom || j.nom }, session).catch((e) => {
+                    if (e.message === 'arrêté')
+                        throw e;
+                    this.journal(`Radar, concurrents de « ${j.nom} » : ${e.message}`);
+                });
+            }
+            const concurrents = this.concurrentsDe(j.id);
+            if (concurrents.length)
+                this.db.prepare(`UPDATE jeux SET suivi = 1 WHERE suivi = 0 AND id IN (${concurrents.map(() => '?').join(',')})`).run(...concurrents);
+        }
+    }
+    /**
+     * Après chaque relevé, pour chacun de tes jeux :
+     * - un concurrent direct passe devant (il était sous 90 % de tes joueurs, il est maintenant au-dessus de 110 %) ;
+     * - un thème de ton titre monte de 40 % ou plus sur 7 jours.
+     * Une alerte par concurrent ou par thème tous les 7 jours au plus ; rien juste après un trou de plus de 24 h ni si les alertes sont coupées.
+     */
+    verifierMesJeux() {
+        const miens = this.db.prepare('SELECT id, nom, devant, alertes FROM mesjeux').all();
+        if (!miens.length)
+            return [];
+        const t = Date.now();
+        const { actives } = this.reglagesAlertes();
+        const prevenir = actives && !this.apresTrou;
+        const jeuDe = this.db.prepare('SELECT nom, joueurs, vu, bots FROM jeux WHERE id = ?');
+        const maj = this.db.prepare('UPDATE mesjeux SET devant = ?, alertes = ? WHERE id = ?');
+        const noter = this.db.prepare('INSERT INTO alertes (t, type, cle, nom, sorte, ratio, joueurs, jeu, auteur) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+        const lire = (texte, defaut) => {
+            try {
+                return texte ? JSON.parse(texte) : defaut;
+            }
+            catch {
+                return defaut;
+            }
+        };
+        let themes = null;
+        const nouvelles = [];
+        this.transaction(() => {
+            for (const m of miens) {
+                const moi = jeuDe.get(m.id);
+                if (!moi?.vu || moi.vu < t - 2 * HEURE)
+                    continue; // pas encore relevé (ou jeu privé)
+                const nom = moi.nom || m.nom || String(m.id);
+                const mesJoueurs = moi.joueurs ?? 0;
+                const dejaVu = m.devant !== null; // premier passage : on note qui est devant, sans prévenir
+                const devant = new Set(lire(m.devant, []));
+                const alertes = lire(m.alertes, {});
+                const libre = (cle) => prevenir && t - (alertes[cle] ?? 0) >= 7 * JOUR;
+                const alerter = (a, cle) => {
+                    alertes[cle] = t;
+                    noter.run(a.t, a.type, a.cle, a.nom, a.sorte, a.ratio, a.joueurs, a.jeu ?? null, a.auteur ?? null);
+                    nouvelles.push(a);
+                };
+                // Concurrents directs : hystérésis 90 % / 110 % pour ne pas prévenir à chaque petit va-et-vient.
+                for (const id of this.concurrentsDe(m.id)) {
+                    const c = jeuDe.get(id);
+                    if (!c?.vu || c.vu < t - 2 * HEURE || (c.bots ?? 0) > 60)
+                        continue;
+                    const j = c.joueurs ?? 0;
+                    if (j < 0.9 * mesJoueurs)
+                        devant.delete(id);
+                    else if (j > 1.1 * mesJoueurs && !devant.has(id)) {
+                        devant.add(id);
+                        // Ton jeu doit avoir un peu de monde, et le concurrent au moins 20 joueurs : sinon ce n'est que du bruit.
+                        if (dejaVu && mesJoueurs >= 5 && j >= 20 && libre(`d:${id}`))
+                            alerter({ t, type: 'mien', cle: String(m.id), nom, sorte: 'depasse', ratio: j / Math.max(1, mesJoueurs), joueurs: j, jeu: id, auteur: c.nom ?? String(id) }, `d:${id}`);
+                    }
+                }
+                // Thèmes de ton titre qui montent (le plus fort seulement, pour ne pas prévenir deux fois pour « tower » et « tower defense »).
+                const mots = motsDuTitre(nom);
+                if (mots.length) {
+                    themes ??= this.themes();
+                    const monte = themes
+                        .filter((th) => th.croissance7 !== null && th.croissance7 >= 40 && th.joueurs >= 200 && th.partN1 < 0.95)
+                        .filter((th) => th.cle.split(' ').every((w) => mots.includes(w)))
+                        .sort((a, b) => (b.croissance7 ?? 0) - (a.croissance7 ?? 0))[0];
+                    const cle = monte ? `t:${(0, exports.cleTriee)(monte.cle)}` : '';
+                    if (monte && libre(cle))
+                        alerter({ t, type: 'mien', cle: String(m.id), nom, sorte: 'themeMonte', ratio: monte.croissance7 ?? 0, joueurs: monte.joueurs, auteur: monte.cle }, cle);
+                }
+                maj.run(JSON.stringify([...devant]), JSON.stringify(alertes), m.id);
+            }
+        });
+        return nouvelles;
     }
     // ----- Données partagées (serveur Lupo) -----
     /**
@@ -953,11 +1180,17 @@ class Radar {
      * et le fusionne ici. Vrai = le serveur a relevé il y a moins de 75 min.
      */
     async importerServeur() {
+        const demander = (nom) => fetch(`${this.serveur}/${nom}`, {
+            headers: { 'User-Agent': 'Lupo' },
+            signal: AbortSignal.timeout(nom.startsWith('etat.json') ? 20_000 : 600_000),
+        }).catch(() => null);
         const lire = async (nom) => {
-            const r = await fetch(`${this.serveur}/${nom}`, {
-                headers: { 'User-Agent': 'Lupo' },
-                signal: AbortSignal.timeout(nom.startsWith('etat.json') ? 20_000 : 600_000),
-            }).catch(() => null);
+            let r = await demander(nom);
+            // Coupure passagère ou GitHub lent : une seconde chance 10 s plus tard avant d'avertir.
+            if ((!r || r.status >= 500) && !this.arrete) {
+                await new Promise((ok) => setTimeout(ok, 10_000));
+                r = await demander(nom);
+            }
             if (!r?.ok)
                 throw new Error(r ? `le serveur a répondu ${r.status} (${nom})` : 'serveur injoignable (connexion ?)');
             return Buffer.from(await r.arrayBuffer());
@@ -1079,30 +1312,22 @@ class Radar {
             for (const [cle, libelle] of cles) {
                 let th = parTheme.get(cle);
                 if (!th)
-                    parTheme.set(cle, (th = { cle, libelle, jeux: 0, avant: 0, apres: 0, top: [] }));
+                    parTheme.set(cle, (th = { cle, libelle, jeux: 0, avant: 0, apres: 0, top: [], ids: new Map() }));
                 th.jeux++;
                 th.avant += a ?? 0;
                 th.apres += g.joueurs ?? 0;
                 th.top.push({ j: g.joueurs ?? 0, ...(g.icone ? { icone: g.icone } : {}) });
+                th.ids.set(g.id, g.joueurs ?? 0);
             }
         }
         const gardes = [...parTheme.values()].filter((th) => th.jeux >= THEME_JEUX_MIN && th.avant >= 200);
-        const parCle = new Map(gardes.map((th) => [th.cle, th]));
-        const redondants = new Set();
-        for (const th of gardes) {
-            const mots = th.cle.split(' ');
-            if (mots.length < 2)
-                continue;
-            for (const m of mots) {
-                const u = parCle.get(m);
-                if (u && th.jeux >= 0.9 * u.jeux)
-                    redondants.add(m);
-            }
-        }
-        const themes = gardes
+        const proteges = this.themesProteges();
+        const redondants = motsRedondants(gardes, proteges);
+        const themes = fusionnerThemes(gardes
             .filter((th) => !redondants.has(th.cle) && th.apres > th.avant * 1.1)
-            .map((th) => ({ ...th, top: th.top.sort((a, b) => b.j - a.j) }))
-            .filter((th) => th.top[0].j < 0.8 * th.apres) // pas un thème porté par un seul jeu
+            .map((th) => ({ ...th, poids: th.apres, top: th.top.sort((a, b) => b.j - a.j) }))
+            .filter((th) => th.top[0].j < 0.8 * th.apres), // pas un thème porté par un seul jeu
+        proteges)
             .sort((a, b) => b.apres / b.avant - a.apres / a.avant)
             .slice(0, 8)
             .map((th) => ({
@@ -1111,6 +1336,7 @@ class Radar {
             avant: th.avant,
             apres: th.apres,
             icones: th.top.slice(0, 3).flatMap((x) => (x.icone ? [x.icone] : [])),
+            ...(th.aussi.length ? { aussi: th.aussi } : {}),
         }));
         // Favoris : % depuis ton départ, ×N depuis l'étoile, palier franchi.
         const favs = this.db.prepare('SELECT type, cle, ajoute, base, nom FROM favoris').all();
@@ -1323,17 +1549,23 @@ class Radar {
     // ----- Thèmes qui montent -----
     /** Thèmes (un mot du titre, ou deux mots qui se suivent) des jeux suivis, avec leur croissance. */
     themes() {
-        if (this.cacheThemes?.v !== this.version)
-            this.cacheThemes = { v: this.version, l: this.calculerThemes() };
-        const suivis = new Set(this.db.prepare("SELECT cle FROM favoris WHERE type = 'theme'").all().map((r) => r.cle.split(' ').sort().join(' ')));
-        return this.cacheThemes.l.map((th) => ({ ...th, suivi: suivis.has(th.cle.split(' ').sort().join(' ')) }));
+        const suivis = this.themesProteges();
+        // Les favoris changent la fusion (un thème suivi n'est jamais fondu) : ils font partie de la clé du cache.
+        const v = `${this.version}|${[...suivis].sort().join(',')}`;
+        if (this.cacheThemes?.v !== v)
+            this.cacheThemes = { v, l: this.calculerThemes(suivis) };
+        return this.cacheThemes.l.map((th) => ({ ...th, suivi: suivis.has((0, exports.cleTriee)(th.cle)) }));
+    }
+    /** Thèmes en favori (clés aux mots triés) : jamais fondus dans un autre. */
+    themesProteges() {
+        return new Set(this.db.prepare("SELECT cle FROM favoris WHERE type = 'theme'").all().map((r) => (0, exports.cleTriee)(r.cle)));
     }
     /**
      * Un thème additionne ses jeux, mais seulement ce qui est comparable : la croissance 7 j prend les jeux qui ont des relevés
      * dans les deux périodes (plus les jeux nés entre-temps), la croissance 24 h ceux relevés à la même heure la veille
      * (plus ceux nés depuis). Un vieux jeu découvert tard ne fait donc pas croire à une hausse. Jeux aux bots probables exclus.
      */
-    calculerThemes() {
+    calculerThemes(proteges) {
         const t = Date.now();
         const rangs = this.db
             .prepare('SELECT id, nom, joueurs, cree, visites, icone, recente, ancienne, j24, rythme FROM jeux WHERE suivi = 1 AND vu IS NOT NULL AND COALESCE(bots, 0) <= 60')
@@ -1368,11 +1600,13 @@ class Radar {
                         rythme: 0,
                         moyen: 0,
                         top: [],
+                        ids: new Map(),
                     };
                     par.set(cle, a);
                 }
                 a.jeux++;
                 a.joueurs += j;
+                a.ids.set(g.id, j);
                 if (jeune) {
                     a.jeunes++;
                     a.joueursJeunes += j;
@@ -1408,21 +1642,9 @@ class Radar {
             }
         }
         const gardes = [...par.values()].filter((a) => a.jeux >= THEME_JEUX_MIN && a.joueurs >= THEME_JOUEURS_MIN);
-        // Un mot presque toujours suivi du même autre (« defense » → « tower defense ») : on garde seulement les deux mots.
-        const parCle = new Map(gardes.map((a) => [a.cle, a]));
-        const redondants = new Set();
-        for (const a of gardes) {
-            const mots = a.cle.split(' ');
-            if (mots.length < 2)
-                continue;
-            for (const m of mots) {
-                const u = parCle.get(m);
-                if (u && a.jeux >= 0.9 * u.jeux)
-                    redondants.add(m);
-            }
-        }
-        return gardes
-            .filter((a) => !redondants.has(a.cle))
+        const redondants = motsRedondants(gardes, proteges);
+        // Thèmes portés par les mêmes jeux (« letter » dans « thai ») : fondus, comme dans le récap (sauf les thèmes en favori).
+        return fusionnerThemes(gardes.filter((a) => !redondants.has(a.cle)).map((a) => ({ ...a, poids: a.joueurs })), proteges)
             .map((a) => ({
             cle: a.libelle,
             jeux: a.jeux,
@@ -1436,6 +1658,7 @@ class Radar {
             partN1: a.joueurs ? a.top[0].joueurs / a.joueurs : 0,
             icones: a.top.map((x) => x.icone).filter((x) => !!x),
             suivi: false,
+            ...(a.aussi.length ? { aussi: a.aussi } : {}),
         }));
     }
     /** Fiche d'un thème : ses jeux (du plus gros au plus petit) et la courbe de ses joueurs. */
