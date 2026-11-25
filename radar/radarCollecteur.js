@@ -76,6 +76,18 @@ async function principal() {
     let etat = { v: 1, maj: 0, lots: [] };
     if (telecharger('etat.json'))
         etat = JSON.parse(fs.readFileSync(path.join(DOSSIER, 'etat.json'), 'utf8'));
+    // Lots notés mais absents de la release (envoi raté autrefois) : retirés, sinon chaque Lupo bute dessus (404).
+    try {
+        const enLigne = new Set(JSON.parse(gh(['release', 'view', ETIQUETTE, '--json', 'assets'])).assets.map((a) => a.name));
+        const manquants = etat.lots.filter((l) => !enLigne.has(l.fichier));
+        if (manquants.length) {
+            etat.lots = etat.lots.filter((l) => enLigne.has(l.fichier));
+            console.log(`Lots absents retirés de etat.json : ${manquants.map((l) => l.fichier).join(', ')}.`);
+        }
+    }
+    catch {
+        /* release pas encore créée */
+    }
     if (telecharger('radar.db.gz')) {
         fs.writeFileSync(path.join(DOSSIER, 'radar.db'), zlib.gunzipSync(fs.readFileSync(path.join(DOSSIER, 'radar.db.gz'))));
         fs.rmSync(path.join(DOSSIER, 'radar.db.gz'));
@@ -108,24 +120,38 @@ async function principal() {
         const tailleBase = gzip(path.join(DOSSIER, 'base.db'), path.join(DOSSIER, 'radar.db.gz'));
         const garder = etat.lots.filter((l) => l.jusqua > jusqua - LOTS_GARDES);
         const retires = etat.lots.filter((l) => !garder.includes(l));
-        etat = {
+        const nouvelEtat = {
             v: 1,
             maj: jusqua,
             cycle: debut,
             base: { fichier: 'radar.db.gz', jusqua, taille: tailleBase },
             lots: [...garder, { fichier: nomLot, depuis, jusqua }],
         };
-        fs.writeFileSync(path.join(DOSSIER, 'etat.json'), JSON.stringify(etat));
+        fs.writeFileSync(path.join(DOSSIER, 'etat.json'), JSON.stringify(nouvelEtat));
+        let publie = false;
         try {
             // Dans cet ordre : un Lupo ne voit dans etat.json que des fichiers déjà en ligne.
             gh(['release', 'upload', ETIQUETTE, path.join(DOSSIER, nomLot), path.join(DOSSIER, 'radar.db.gz'), '--clobber']);
             gh(['release', 'upload', ETIQUETTE, path.join(DOSSIER, 'etat.json'), '--clobber']);
+            publie = true;
             console.log(`Publié : lot ${Math.round(tailleLot / 1024)} Ko, base ${Math.round(tailleBase / 1024 / 1024)} Mo.`);
         }
         catch (err) {
             console.log(`Publication ratée : ${err.message}`);
         }
         fs.rmSync(path.join(DOSSIER, nomLot), { force: true });
+        // Raté : l'état reste l'ancien (le prochain lot repart du dernier publié et couvre aussi ce relevé). Lot en trop retiré.
+        if (!publie) {
+            try {
+                gh(['release', 'delete-asset', ETIQUETTE, nomLot, '-y']);
+            }
+            catch {
+                /* jamais envoyé */
+            }
+            etat = { ...etat, cycle: debut };
+            continue;
+        }
+        etat = nouvelEtat;
         for (const l of retires) {
             try {
                 gh(['release', 'delete-asset', ETIQUETTE, l.fichier, '-y']);

@@ -1196,7 +1196,7 @@ class Radar {
                 r = await demander(nom);
             }
             if (!r?.ok)
-                throw new Error(r ? `le serveur a répondu ${r.status} (${nom})` : 'serveur injoignable (connexion ?)');
+                throw Object.assign(new Error(r ? `le serveur a répondu ${r.status} (${nom})` : 'serveur injoignable (connexion ?)'), { status: r?.status });
             return Buffer.from(await r.arrayBuffer());
         };
         const e = JSON.parse((await lire('etat.json')).toString('utf8'));
@@ -1215,8 +1215,21 @@ class Radar {
         const temp = path.join(this.dossier, 'serveur.db');
         const limite = debutJour(jourDe(Date.now()) - JOURS_DETAILLES + 1);
         for (let i = 0; i < fichiers.length; i++) {
-            const f = fichiers[i];
-            const brut = await lire(f.nom);
+            let f = fichiers[i];
+            let brut;
+            try {
+                brut = await lire(f.nom);
+            }
+            catch (err) {
+                // Lot absent du serveur (son envoi y a raté) : la base complète le remplace, avec les lots plus récents qu'elle.
+                const base = e.base;
+                if (err.status !== 404 || !base || f.nom === base.fichier || base.jusqua <= jusqua)
+                    throw err;
+                const suite = lots.filter((l) => l.jusqua > base.jusqua).map((l) => ({ nom: l.fichier, jusqua: l.jusqua }));
+                fichiers.splice(i, fichiers.length - i, { nom: base.fichier, jusqua: base.jusqua }, ...suite);
+                f = fichiers[i];
+                brut = await lire(f.nom);
+            }
             if (this.arrete)
                 return false;
             fs.writeFileSync(temp, f.nom.endsWith('.gz') ? await (0, node_util_1.promisify)(zlib.gunzip)(brut) : brut);
