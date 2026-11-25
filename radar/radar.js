@@ -632,6 +632,10 @@ class Radar {
         const r = this.db.prepare('SELECT valeur FROM meta WHERE cle = ?').get(cle);
         return r?.valeur;
     }
+    /** Comme `meta`, mais sans erreur si Lupo se ferme pendant un cycle (base déjà fermée) : les étapes suivantes s'arrêtent d'elles-mêmes. */
+    metaSure(cle) {
+        return this.arrete ? undefined : this.meta(cle);
+    }
     ecrireMeta(cle, valeur) {
         this.db.prepare('INSERT INTO meta (cle, valeur) VALUES (?, ?) ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur').run(cle, String(valeur));
     }
@@ -740,15 +744,15 @@ class Radar {
         const absence = this.serveur !== null && this.absentDepuis && maintenant - this.absentDepuis >= ABSENCE_RECAP ? this.absentDepuis : null;
         this.absentDepuis = null;
         let alertesAbsence = [];
-        if (maintenant - Number(this.meta('decouverteLe') ?? 0) >= DECOUVERTE_TOUS)
+        if (maintenant - Number(this.metaSure('decouverteLe') ?? 0) >= DECOUVERTE_TOUS)
             await etape('Recherche de nouveaux jeux', async () => {
                 await this.decouvrir(partage);
                 this.ecrireMeta('decouverteLe', maintenant);
             });
-        await etape('Nouveaux jeux des studios', () => this.verifierCreateurs(!partage && maintenant - Number(this.meta('createursLe') ?? 0) >= CREATEURS_TOUS));
+        await etape('Nouveaux jeux des studios', () => this.verifierCreateurs(!partage && maintenant - Number(this.metaSure('createursLe') ?? 0) >= CREATEURS_TOUS));
         await etape('Tes jeux et leurs concurrents', () => this.suivreMesJeux());
         await etape('Relevé des joueurs', () => this.relever(partage));
-        if (!partage && maintenant - Number(this.meta('votesLe') ?? 0) >= VOTES_TOUS)
+        if (!partage && maintenant - Number(this.metaSure('votesLe') ?? 0) >= VOTES_TOUS)
             await etape('Lecture des votes', async () => {
                 await this.lireVotes();
                 this.ecrireMeta('votesLe', maintenant);
@@ -777,7 +781,7 @@ class Radar {
         // Jeux semblables : 3 recherches par jeu, faites par le serveur quand il est là (moins de demandes à Roblox par Lupo).
         if (!partage)
             await etape('Recherche des jeux semblables', () => this.chercherSemblables());
-        if (maintenant - Number(this.meta('maintenanceLe') ?? 0) >= JOUR)
+        if (maintenant - Number(this.metaSure('maintenanceLe') ?? 0) >= JOUR)
             await etape('Rangement de l’historique', async () => {
                 this.ranger();
                 this.ecrireMeta('maintenanceLe', maintenant);
